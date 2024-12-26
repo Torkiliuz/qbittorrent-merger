@@ -1,21 +1,30 @@
-//
-// Merge identical files from different torrents via qBittorrent API
-//
-
-use itertools::Itertools;
-use std::collections::HashSet;
+use log::{debug, error, info, warn};
+use qbit_rs::model::{Credential, Preferences, PieceState, TorrentContent, TorrentProperty};
+use qbit_rs::Qbit;
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader, BufWriter};
-use std::{collections::HashMap, fs::File};
+use std::{fs::File};
 
-use log::{debug, error, info, warn};
-use qbit_rs::model::{Preferences, TorrentContent, TorrentProperty};
-use qbit_rs::{
-    model::{Credential, PieceState},
-    Qbit,
-};
-use sha1::{Digest, Sha1};
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    host: String,
+    username: String,
+    password: String,
+}
+
+impl Config {
+    fn load(path: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = path.unwrap_or("config.json");
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let config = serde_json::from_reader(reader)?;
+        Ok(config)
+    }
+}
 
 struct Torrent {
     hash: String,
@@ -50,11 +59,7 @@ impl Torrent {
     fn piece_is_downloaded(&self, piece: &TorrentPiece) -> bool {
         let piece = match self.pieces_states.get(piece.idx) {
             Some(p) => p,
-            None => {
-                // beyond last piece if alignment between src and dst is different
-                // TODO: proper fix
-                return false;
-            }
+            None => return false,
         };
         match piece {
             PieceState::Downloaded => true,
@@ -67,16 +72,15 @@ fn get_sha1(data: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(data);
     let sha1: [u8; 20] = hasher.finalize().into();
-
     sha1
 }
 
-/// A chunk of a file
 #[derive(Debug, Copy, Clone)]
 struct FileBlock {
     offset: u64,
     size: u64,
 }
+
 impl FileBlock {
     fn contains(&self, other: &Self) -> bool {
         self.offset <= other.offset && self.offset + self.size >= other.offset + other.size
@@ -85,9 +89,7 @@ impl FileBlock {
 
 #[derive(Debug, Copy, Clone)]
 enum Piece {
-    /// Fake piece, not aligned
     VirtualPiece(VirtualPiece),
-    /// A real piece from a torrent, starting offset is aligned on `piece_size`
     TorrentPiece(TorrentPiece),
 }
 
@@ -102,11 +104,10 @@ struct TorrentPiece {
     idx: usize,
     piece_size: u64,
 }
+
 impl TorrentPiece {
-    /// Merge multiple consecutive pieces into one big virtual piece
     fn merge(list: &[TorrentPiece]) -> Option<VirtualPiece> {
         let first_piece = list.get(0)?;
-
         Some(VirtualPiece {
             offset: first_piece.idx * first_piece.piece_size as usize,
             piece_size: list.len() as u64 * first_piece.piece_size,
@@ -123,37 +124,30 @@ fn piece_to_file_block(
             let mut offset = piece.idx as u64 * piece.piece_size;
             for f in &torrent.content {
                 if offset < f.size {
-                    //let file_start = piece.idx as u64 * piece.piece_size - offset;
-                    // piece is inside file
                     let file_block = FileBlock {
                         offset,
                         size: piece.piece_size,
                     };
                     return Ok((f.name.clone(), file_block));
                 } else {
-                    // maybe in next file?
                     offset -= f.size;
                 }
             }
-
             Err("Piece outside of torrent".into())
         }
         Piece::VirtualPiece(piece) => {
             let mut offset = piece.offset as u64;
             for f in &torrent.content {
                 if offset < f.size {
-                    // piece is inside file
                     let file_block = FileBlock {
                         offset,
                         size: piece.piece_size,
                     };
                     return Ok((f.name.clone(), file_block));
                 } else {
-                    // maybe in next file?
                     offset -= f.size;
                 }
             }
-
             Err("Piece outside of torrent".into())
         }
     }
@@ -171,7 +165,6 @@ fn file_block_to_pieces(
             if file_block.offset > f.size {
                 return Err(format!("Offset beyond file {} {}", file_block.offset, path).into());
             } else {
-                // offset inside file
                 offset += file_block.offset;
                 let start_idx = (offset / piece_size) as usize;
                 let end_idx = ((offset + file_block.size).div_ceil(piece_size)) as usize;
@@ -186,7 +179,6 @@ fn file_block_to_pieces(
             offset += f.size;
         }
     }
-
     Err(format!("File not found {:?}", path).into())
 }
 
@@ -206,7 +198,6 @@ fn convert_filename(
             }
         }
     }
-
     Err(format!("File not found {:?}", filename).into())
 }
 
@@ -258,14 +249,12 @@ fn find_same_size_files(t1: &Torrent, t2: &Torrent) -> Vec<(Vec<String>, Vec<Str
     for f in t1.content.iter() {
         let size = f.size;
         let name = f.name.clone();
-
         t1_files.entry(size).or_default().push(name);
     }
     let mut t2_files: HashMap<u64, Vec<String>> = HashMap::new();
     for f in t2.content.iter() {
         let size = f.size;
         let name = f.name.clone();
-
         t2_files.entry(size).or_default().push(name);
     }
 
@@ -276,18 +265,14 @@ fn find_same_size_files(t1: &Torrent, t2: &Torrent) -> Vec<(Vec<String>, Vec<Str
     for common in t1_keys.intersection(&t2_keys) {
         let a = t1_files.get(common).unwrap().clone();
         let b = t2_files.get(common).unwrap().clone();
-
         common_files.push((a, b));
     }
-
     common_files
 }
 
 fn get_missing_pieces(torrent: &Torrent, path: &str) -> Vec<usize> {
     let piece_size = torrent.properties.piece_size.unwrap() as u64;
-
     let offset = get_file_offset(&torrent.content, path).unwrap();
-
     let starting_idx = offset / piece_size;
     let file_size = torrent
         .content
@@ -296,7 +281,6 @@ fn get_missing_pieces(torrent: &Torrent, path: &str) -> Vec<usize> {
         .expect("File not found")
         .size;
     let n_pieces = file_size / piece_size;
-
     let last_idx = starting_idx + n_pieces;
 
     let missing_pieces_idx: Vec<usize> = torrent
@@ -335,26 +319,9 @@ fn get_file_offset(
     if !found {
         return Err(format!("File not found: {:?}", path).into());
     }
-
     Ok(offset)
 }
 
-/// The ugly stuff
-///
-/// Overall process:
-/// 1) find files with same size, then for each file:
-/// 2) find missing pieces that belong to said file, then for each piece:
-/// 3) get the file offset for the piece in the src torrent, and check if it is downloaded
-/// 4) convert to piece in the dst torrent
-/// 5) convert to file offset in the dst torrent
-/// 6) Copy data from src to dst files
-///
-/// Careful with:
-/// * Pieces can have different sizes between torrents
-/// * Pieces can be misaligned if some files are present before the file that we want to restore (acting as padding). In that case, if he padding file is incomplete, it is not possible to restore the 1st piece of the 2nd file, because we can not check a hash overlapping unknown data
-/// * 1 piece from dst can have multiple corresponding pieces in src, because it can span multiple pieces
-/// * Last piece is probably not handled correctly
-///
 async fn merge_torrents(
     api: &Qbit,
     src_hash: &str,
@@ -417,7 +384,6 @@ async fn merge_torrents(
                 piece_to_file_block(&dst_torrent, &Piece::TorrentPiece(dst_piece)).unwrap();
             debug!("filename: {}, fileblock: {:?}", &filename, &dst_file_block);
 
-            // TODO: handle all combinations of files
             let src_filename = match convert_filename(&same_files, &filename) {
                 Ok(x) => x,
                 Err(_) => continue,
@@ -453,7 +419,14 @@ async fn merge_torrents(
                 continue 'missing_pieces_loop;
             }
 
-            let data = read_piece(&mut src_f, virt_src_file_block).expect("Can't read piece");
+            let data = match read_piece(&mut src_f, virt_src_file_block) {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to read piece: {:?}", e);
+                    unavailable_pieces += 1;
+                    continue 'missing_pieces_loop;
+                }
+            };
             let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
             let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
             let computed_hash = get_sha1(data);
@@ -471,30 +444,29 @@ async fn merge_torrents(
         }
     }
 
-    info!("Retored pieces: {}", restored_pieces);
+    info!("Restored pieces: {}", restored_pieces);
     info!("Unavailable pieces: {}", unavailable_pieces);
     info!("Data outside file block: {}", data_outside_file_block);
 
     info!("Please recheck torrents!");
-    //api.recheck_torrents(&[dst_torrent.hash.clone()]).await?;
     Ok(())
 }
 
-async fn work(hashes: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let credential = Credential::new("admin", "");
-    let api = Qbit::new("http://localhost:8080", credential);
+async fn work(config_path: Option<&str>, hashes: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load(config_path)?;
+    let credential = Credential::new(&config.username, &config.password);
+    let api = Qbit::new(config.host.as_str(), credential);
 
     let version = api.get_version().await?;
     info!("qBittorrent version: {}", version);
 
-    // Loop over all couple of hashes
-    for hashes in hashes.iter().combinations(2) {
-        // Loop over (src, dst), (dst, src)
-        for (src_hash, dst_hash) in &[(hashes[0], hashes[1]), (hashes[1], hashes[0])] {
-            merge_torrents(&api, &src_hash, &dst_hash).await?;
+    for src_hash in hashes.iter() {
+        for dst_hash in hashes.iter() {
+            if src_hash != dst_hash {
+                merge_torrents(&api, src_hash, dst_hash).await?;
+            }
         }
     }
-
     Ok(())
 }
 
@@ -504,10 +476,12 @@ async fn main() {
 
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 3 {
-        error!("Usage: {} <complete hash> <incomplete hash>", args[0]);
+        error!("Usage: {} <complete hash> <incomplete hash> [config.json]", args[0]);
         std::process::exit(1);
     }
-    let hashes = &args[1..];
+    
+    let config_path = args.get(3).map(String::as_str);
+    let hashes = args[1..3].to_vec();
 
-    work(hashes).await.unwrap();
+    work(config_path, &hashes).await.unwrap();
 }
